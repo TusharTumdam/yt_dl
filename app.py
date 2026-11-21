@@ -1,25 +1,59 @@
 #!/usr/bin/env python3
 """
-Standalone Flask + yt-dlp YouTube Video Downloader Web App (Extreme UI Edition).
-Run:
-    pip install flask yt-dlp
-    python app.py
+Secured Standalone Flask + yt-dlp YouTube Video Downloader Web App.
+Security features:
+  - Password/PIN login (set APP_PASSWORD env var; default: 'ytstudio123')
+  - Strict YouTube-only URL validation (SSRF protection)
+  - Security headers (X-Frame-Options, X-Content-Type-Options, Referrer-Policy)
+  - Concurrent download limit & automatic 1-hour file cleanup
 """
 
+import hmac
+import os
 import re
+import secrets
 import shutil
 import socket
 import threading
+import time
 import uuid
+from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 import yt_dlp
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+if os.environ.get("RENDER"):
+    app.config["SESSION_COOKIE_SECURE"] = True
+
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "ytstudio123")
 DOWNLOAD_ROOT = Path("downloads")
 TASKS: dict[str, dict] = {}
+MAX_ACTIVE_TASKS = 3
+FILE_TTL_SECONDS = 3600  # Auto-delete files after 1 hour
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+ALLOWED_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
 
 QUALITY_FORMATS = {
     "best": "bv*+ba/b",
@@ -28,6 +62,45 @@ QUALITY_FORMATS = {
     "480p": "bv*[height<=480]+ba/b[height<=480]/b",
     "360p": "bv*[height<=360]+ba/b[height<=360]/b",
 }
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _is_valid_youtube_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in ALLOWED_HOSTS
+    except Exception:
+        return False
+
+
+def _cleanup_old_files() -> None:
+    if not DOWNLOAD_ROOT.exists():
+        return
+    now = time.time()
+    for p in DOWNLOAD_ROOT.iterdir():
+        try:
+            if p.is_file() and (now - p.stat().st_mtime) > FILE_TTL_SECONDS:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("authenticated"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Authentication required"}), 401
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 def _clean_ansi(text: str) -> str:
@@ -89,6 +162,41 @@ def _compute_quality_sizes(info: dict) -> dict[str, str]:
     }
 
 
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign In — YT Studio Downloader</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+</head>
+<body class="bg-[#05070d] text-slate-100 min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-sm rounded-3xl bg-slate-900/80 border border-white/10 p-6 sm:p-8 shadow-2xl space-y-5">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-2xl bg-gradient-to-br from-rose-500 to-fuchsia-600 flex items-center justify-center font-bold text-white">&#9654;</div>
+      <div>
+        <h1 class="text-lg font-bold text-white">YT Studio Downloader</h1>
+        <p class="text-xs text-slate-400">Protected Access</p>
+      </div>
+    </div>
+    {% if error %}
+      <div class="px-3.5 py-2.5 rounded-xl bg-rose-950/90 border border-rose-500/40 text-xs text-rose-200">{{ error }}</div>
+    {% endif %}
+    <form method="POST" class="space-y-4">
+      <div>
+        <label for="password" class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Access Password</label>
+        <input id="password" name="password" type="password" required autofocus placeholder="Enter password" class="w-full px-4 py-3 rounded-2xl bg-black/50 border border-white/10 text-sm text-white focus:outline-none focus:ring-2 focus:ring-rose-500" />
+      </div>
+      <button type="submit" class="w-full py-3 rounded-2xl bg-gradient-to-r from-rose-500 to-rose-600 text-white text-sm font-bold shadow-lg shadow-rose-500/30 hover:brightness-110 transition">
+        Unlock Downloader
+      </button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -135,7 +243,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body class="text-slate-100 min-h-screen antialiased pb-14">
   <div id="toast-container" class="fixed bottom-4 right-4 left-4 sm:left-auto z-50 flex flex-col gap-2 sm:max-w-sm pointer-events-none"></div>
 
-  <!-- Top Studio Bar -->
   <header class="sticky top-0 z-30 border-b border-white/10 bg-[#070a12]/80 backdrop-blur-xl">
     <div class="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between gap-3">
       <div class="flex items-center gap-3 min-w-0">
@@ -144,21 +251,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="min-w-0">
           <h1 class="text-base sm:text-lg font-extrabold tracking-tight text-white truncate">YT Studio Downloader</h1>
-          <p class="text-[11px] text-slate-400 truncate">4K Video &middot; MP3 Audio &middot; Live Speed &amp; Size</p>
+          <p class="text-[11px] text-slate-400 truncate">Protected &middot; 4K Video &amp; MP3</p>
         </div>
       </div>
-      <div class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-400/20 text-emerald-300 text-xs font-semibold shrink-0">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        Online
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-400/20 text-emerald-300 text-xs font-semibold">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          Secured
+        </span>
+        <a href="/logout" class="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-slate-300 transition">Logout</a>
       </div>
     </div>
   </header>
 
   <main class="max-w-4xl mx-auto px-4 pt-6 space-y-6">
-    <!-- Hero Input & Control Panel -->
     <section class="glass rounded-3xl p-4 sm:p-6 shadow-2xl space-y-5">
       <form id="download-form" class="space-y-5">
-        <!-- URL Bar -->
         <div>
           <div class="flex items-center justify-between mb-2">
             <label for="url-input" class="text-xs font-bold uppercase tracking-wider text-slate-400">Paste YouTube Link</label>
@@ -183,7 +291,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Video Preview Card -->
         <div id="preview-card" class="hidden rounded-2xl bg-black/40 border border-white/10 p-3.5 sm:p-4 flex-col sm:flex-row gap-4">
           <div class="relative w-full sm:w-52 aspect-video rounded-xl overflow-hidden bg-slate-900 shrink-0 shadow-lg">
             <img id="preview-thumb" src="" alt="Thumbnail" class="w-full h-full object-cover" />
@@ -196,17 +303,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Mode Toggle -->
         <div class="grid grid-cols-2 gap-2 p-1.5 rounded-2xl bg-black/50 border border-white/10">
-          <button type="button" id="mode-video-btn" class="py-2.5 rounded-xl text-xs sm:text-sm font-bold transition">
-            Video (MP4)
-          </button>
-          <button type="button" id="mode-audio-btn" class="py-2.5 rounded-xl text-xs sm:text-sm font-bold transition">
-            Audio Only (MP3)
-          </button>
+          <button type="button" id="mode-video-btn" class="py-2.5 rounded-xl text-xs sm:text-sm font-bold transition">Video (MP4)</button>
+          <button type="button" id="mode-audio-btn" class="py-2.5 rounded-xl text-xs sm:text-sm font-bold transition">Audio Only (MP3)</button>
         </div>
 
-        <!-- Quality Cards Grid -->
         <div id="quality-section" class="space-y-2">
           <div class="flex items-center justify-between">
             <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Select Quality &amp; File Size</span>
@@ -215,7 +316,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="quality-grid" class="grid grid-cols-2 sm:grid-cols-5 gap-2.5"></div>
         </div>
 
-        <!-- Extra Toggles -->
         <div class="flex flex-wrap items-center gap-4 pt-1">
           <label class="inline-flex items-center gap-2.5 text-xs font-medium text-slate-300 cursor-pointer select-none">
             <input id="subtitles-toggle" type="checkbox" class="w-4 h-4 accent-rose-500 rounded" />
@@ -229,7 +329,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </form>
     </section>
 
-    <!-- Active & Completed Downloads -->
     <section class="glass rounded-3xl p-4 sm:p-6 shadow-2xl space-y-4">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2.5">
@@ -258,12 +357,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         { id: '360p', label: '360p', sub: 'Data Saver' },
       ];
 
-      const state = {
-        mode: 'video',
-        quality: 'best',
-        sizes: null,
-        queue: [],
-      };
+      const state = { mode: 'video', quality: 'best', sizes: null, queue: [] };
 
       const urlInput = document.getElementById('url-input');
       const pasteBtn = document.getElementById('paste-btn');
@@ -305,15 +399,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const active = state.quality === q.id;
           const sizeText = state.sizes && state.sizes[q.id] ? state.sizes[q.id] : q.sub;
           return `
-            <button
-              type="button"
-              data-q="${q.id}"
-              class="q-card text-left p-3 rounded-2xl border transition ${
-                active
-                  ? 'bg-rose-500/15 border-rose-500 shadow-lg shadow-rose-500/15'
-                  : 'bg-black/40 border-white/10 hover:border-white/25'
-              }"
-            >
+            <button type="button" data-q="${q.id}" class="q-card text-left p-3 rounded-2xl border transition ${
+              active ? 'bg-rose-500/15 border-rose-500 shadow-lg shadow-rose-500/15' : 'bg-black/40 border-white/10 hover:border-white/25'
+            }">
               <div class="flex items-center justify-between">
                 <span class="text-sm font-extrabold ${active ? 'text-white' : 'text-slate-200'}">${q.label}</span>
                 ${active ? '<span class="w-2 h-2 rounded-full bg-rose-500"></span>' : ''}
@@ -374,11 +462,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                   ${sizeInfo ? `<div class="text-[11px] text-slate-400 tabular-nums">${sizeInfo}</div>` : ''}
                 </div>
               </div>
-
               <div class="relative w-full h-3 rounded-full bg-slate-800/90 overflow-hidden">
                 <div class="relative h-full rounded-full transition-all duration-300 ${barClass}" style="width:${Math.min(100, Number(item.progress || 0))}%"></div>
               </div>
-
               <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 tabular-nums">
                 <span>
                   ${isFail ? `<span class="text-rose-300">${item.error || 'Error'}</span>` : isDone ? `Saved (${item.total_str || 'Ready'})` : `${item.speed || 'Starting...'} &middot; ETA ${item.eta || '...'}`}
@@ -399,6 +485,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (!item) return;
         try {
           const res = await fetch('/api/status/' + taskId);
+          if (res.status === 401) { window.location.href = '/login'; return; }
           const data = await res.json();
           Object.assign(item, data);
           renderQueue();
@@ -415,19 +502,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       pasteBtn.addEventListener('click', async () => {
         try {
           const text = await navigator.clipboard.readText();
-          if (text) {
-            urlInput.value = text;
-            showToast('Link pasted!', 'success');
-          }
-        } catch {
-          showToast('Tap the URL box and paste manually.', 'info');
-        }
+          if (text) { urlInput.value = text; showToast('Link pasted!', 'success'); }
+        } catch { showToast('Tap the URL box and paste manually.', 'info'); }
       });
 
-      clearBtn.addEventListener('click', () => {
-        urlInput.value = '';
-        urlInput.focus();
-      });
+      clearBtn.addEventListener('click', () => { urlInput.value = ''; urlInput.focus(); });
 
       qualityGrid.addEventListener('click', (e) => {
         const btn = e.target.closest('.q-card');
@@ -446,6 +525,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         fetchInfoBtn.textContent = 'Checking...';
         try {
           const res = await fetch('/api/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+          if (res.status === 401) { window.location.href = '/login'; return; }
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Could not inspect URL');
           previewThumb.src = data.thumbnail || '';
@@ -483,6 +563,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               subtitles: subtitlesToggle.checked,
             }),
           });
+          if (res.status === 401) { window.location.href = '/login'; return; }
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Could not start download');
           state.queue.unshift({
@@ -517,17 +598,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        entered = request.form.get("password", "")
+        if hmac.compare_digest(entered, APP_PASSWORD):
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        error = "Incorrect password. Please try again."
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@_login_required
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 
 @app.route("/api/info", methods=["POST"])
+@_login_required
 def api_info():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "URL is required"}), 400
+    if not _is_valid_youtube_url(url):
+        return jsonify({"error": "Only valid YouTube URLs are allowed"}), 400
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "nocolor": True}) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -545,6 +646,7 @@ def api_info():
 
 def _run_download(task_id: str, url: str, quality: str, audio_only: bool, playlist: bool, subtitles: bool):
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    _cleanup_old_files()
     has_ffmpeg = shutil.which("ffmpeg") is not None
 
     def hook(status):
@@ -624,11 +726,16 @@ def _run_download(task_id: str, url: str, quality: str, audio_only: bool, playli
 
 
 @app.route("/api/download", methods=["POST"])
+@_login_required
 def api_download():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "URL is required"}), 400
+    if not _is_valid_youtube_url(url):
+        return jsonify({"error": "Only valid YouTube URLs are allowed"}), 400
+
+    active_count = sum(1 for t in TASKS.values() if t.get("status") == "Downloading")
+    if active_count >= MAX_ACTIVE_TASKS:
+        return jsonify({"error": "Too many active downloads. Wait for one to finish."}), 429
 
     task_id = uuid.uuid4().hex[:10]
     TASKS[task_id] = {
@@ -656,6 +763,7 @@ def api_download():
 
 
 @app.route("/api/status/<task_id>")
+@_login_required
 def api_status(task_id: str):
     task = TASKS.get(task_id)
     if not task:
@@ -674,6 +782,7 @@ def api_status(task_id: str):
 
 
 @app.route("/api/file/<task_id>")
+@_login_required
 def api_file(task_id: str):
     task = TASKS.get(task_id)
     if not task or not task.get("filepath"):
